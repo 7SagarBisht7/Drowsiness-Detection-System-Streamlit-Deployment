@@ -1,0 +1,9 @@
+streamlit
+streamlit-webrtc
+opencv-python-headless
+mediapipe
+numpy
+joblib
+tensorflow-cpu
+scikit-learn
+av
