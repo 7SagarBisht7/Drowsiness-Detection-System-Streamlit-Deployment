@@ -4,5 +4,5 @@ opencv-contrib-python==4.13.0.92
 mediapipe==0.10.32
 numpy==2.4.3
 joblib==1.5.3
-tensorflow-cpu==2.21.0
+tensorflow-cpu==2.15.0
 av==16.1.0
