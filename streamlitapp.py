@@ -15,12 +15,12 @@ import base64
 st.set_page_config(page_title="LSTM Drowsiness Detector", layout="wide")
 st.title("Real-Time Drowsiness Detection System")
 
-# --- Constants ---
+# --- Constants (Tuned for WebRTC Latency) ---
 MODEL_PATH = "drowsiness_model.h5"
 SCALER_PATH = "scaler.pkl"
 SEQ_LEN = 30                
-ALERT_CONSEC_FRAMES = 10     
-PRED_THRESHOLD = 0.7         
+ALERT_CONSEC_FRAMES = 5      # Lowered from 10: Triggers alert faster on web FPS
+PRED_THRESHOLD = 0.55        # Lowered from 0.7: More forgiving of temporal stretching
 PITCH_DROWSY_THRESHOLD = -160.0 
 
 LEFT_EYE = [362, 385, 387, 263, 373, 380]
@@ -73,7 +73,8 @@ def euler(rot_vec):
     return math.degrees(x), math.degrees(y), math.degrees(z)
 
 class BlinkDetector:
-    def __init__(self, ear_thresh=0.30, consec_frames=3):
+    # Changed consec_frames to 1 so blinks aren't missed on lower frame rates
+    def __init__(self, ear_thresh=0.30, consec_frames=1):
         self.ear_thresh = ear_thresh
         self.consec_frames = consec_frames
         self.counter = 0
@@ -96,7 +97,7 @@ class DrowsinessProcessor(VideoProcessorBase):
     def __init__(self):
         self.data_buffer = deque(maxlen=SEQ_LEN)
         self.consec_alert_frames = 0
-        self.blink_detector = BlinkDetector(ear_thresh=0.30, consec_frames=3)
+        self.blink_detector = BlinkDetector(ear_thresh=0.30, consec_frames=1)
         self.status = "STARTING..."
         self.color = (0, 255, 255)
         self.is_drowsy = False 
@@ -157,18 +158,19 @@ class DrowsinessProcessor(VideoProcessorBase):
                     self.color = (0, 255, 0) 
                     self.is_drowsy = False 
 
+                # Shifted Y down to 80
                 conf_text = f"LSTM Conf: {drowsy_prob:.2f}"
-                cv2.putText(img, conf_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(img, conf_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 
             else:
                 self.status = f"WARMING UP LSTM... {len(self.data_buffer)}/{SEQ_LEN}"
                 self.color = (0, 255, 255)
                 self.is_drowsy = False
 
-            # Draw Debug Info
+            # Draw Debug Info (Shifted Y coordinates down so they don't get cropped)
             debug_color = (255, 255, 0) 
-            cv2.putText(img, f"EAR: {avg_ear:.2f} | MAR: {mar_val:.2f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, debug_color, 2)
-            cv2.putText(img, f"Pitch: {pitch:.1f} | Blink: {blink_duration:.2f}s", (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, debug_color, 2)
+            cv2.putText(img, f"EAR: {avg_ear:.2f} | MAR: {mar_val:.2f}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, debug_color, 2)
+            cv2.putText(img, f"Pitch: {pitch:.1f} | Blink: {blink_duration:.2f}s", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, debug_color, 2)
 
         else:
             self.data_buffer.clear()
@@ -179,7 +181,8 @@ class DrowsinessProcessor(VideoProcessorBase):
             self.color = (0, 0, 255)
             self.is_drowsy = False
 
-        cv2.putText(img, f"Status: {self.status}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.color, 2)
+        # Shifted Status Y down to 50
+        cv2.putText(img, f"Status: {self.status}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.color, 2)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
@@ -196,10 +199,12 @@ def get_audio_html(file_path):
 # --- Main Streamlit Execution ---
 st.write("Click 'Start' to activate your webcam and begin drowsiness detection.")
 
+# Added media_stream_constraints to force 640x480 resolution
 ctx = webrtc_streamer(
     key="drowsiness",
     video_processor_factory=DrowsinessProcessor,
-    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+    media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False}
 )
 
 audio_placeholder = st.empty()
@@ -209,7 +214,8 @@ if ctx.state.playing:
     while True:
         if ctx.video_processor:
             if ctx.video_processor.is_drowsy:
-                audio_placeholder.markdown(get_audio_html("alarm.wav"), unsafe_allow_html=True)
+                # Using 'alert.wav' based on your repository screenshot
+                audio_placeholder.markdown(get_audio_html("alert.wav"), unsafe_allow_html=True)
                 time.sleep(1.5) # Throttle the alarm playback
             else:
                 audio_placeholder.empty()
