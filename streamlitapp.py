@@ -1,19 +1,4 @@
 import streamlit as st
-import os
-import subprocess
-import sys
-
-@st.cache_resource
-def fix_opencv_permissions():
-    python_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    cv2_path = f"/home/adminuser/venv/lib/{python_version}/site-packages/cv2"
-    
-    if os.path.exists(cv2_path):
-        os.system(f"chmod -R 777 {cv2_path}")
-        subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "opencv-contrib-python"])
-        subprocess.call([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", "opencv-python-headless"])
-
-fix_opencv_permissions()
 import cv2
 import mediapipe as mp
 import numpy as np
