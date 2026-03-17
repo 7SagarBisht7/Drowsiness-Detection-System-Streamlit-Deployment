@@ -1,8 +1,8 @@
-streamlit==1.55.0
-streamlit-webrtc==0.64.5
-opencv-contrib-python==4.13.0.92
-mediapipe==0.10.32
-numpy==2.4.3
-joblib==1.5.3
+streamlit
+streamlit-webrtc
+opencv-contrib-python<4.10.0.0
+mediapipe
+numpy<2.0.0
+joblib
 tensorflow-cpu==2.15.0
-av==16.1.0
+av
