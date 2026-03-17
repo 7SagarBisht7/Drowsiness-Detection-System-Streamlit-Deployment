@@ -1,9 +1,8 @@
-streamlit
-streamlit-webrtc
-opencv-python-headless
-mediapipe
-numpy
-joblib
-tensorflow-cpu
-scikit-learn
-av
+streamlit==1.55.0
+streamlit-webrtc==0.64.5
+opencv-python-headless==4.13.0.92
+mediapipe==0.10.32
+numpy==2.4.3
+joblib==1.5.3
+tensorflow-cpu==2.21.0
+av==16.1.0
