@@ -6,3 +6,4 @@ numpy<2.0.0
 joblib
 tensorflow-cpu==2.16.1
 av
+scikit-learn
