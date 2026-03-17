@@ -1,4 +1,16 @@
 import streamlit as st
+import subprocess
+import sys
+
+# --- THE FIX ---
+
+@st.cache_resource
+def fix_opencv():
+    subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "opencv-contrib-python"])
+    subprocess.call([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", "opencv-python-headless"])
+
+fix_opencv()
+
 import cv2
 import mediapipe as mp
 import numpy as np
