@@ -40,7 +40,8 @@ def load_models():
     scaler = joblib.load(SCALER_PATH)
     mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
         max_num_faces=1,
-        refine_landmarks=True,
+        # LATENCY FIX 1: Turn off pupil refinement. Saves ~30% CPU per frame.
+        refine_landmarks=False, 
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
     )
@@ -100,89 +101,94 @@ class DrowsinessProcessor(VideoProcessorBase):
         self.status = "STARTING..."
         self.color = (0, 255, 255)
         self.is_drowsy = False 
+        
+        # LATENCY FIX 2: Frame Skipping Variables
+        self.frame_count = 0
+        self.last_drowsy_prob = 0.0
+        self.last_avg_ear = 0.0
+        self.last_mar_val = 0.0
+        self.last_pitch = 0.0
+        self.last_blink = 0.0
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        h, w, _ = img.shape
-        
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        res = face_mesh.process(rgb)
+        self.frame_count += 1
 
-        pitch = 0.0 
-        
-        if res.multi_face_landmarks:
-            lm = res.multi_face_landmarks[0].landmark
+        # LATENCY FIX 2 (Execution): Only process heavy math on every 2nd frame
+        # On skipped frames, we just draw the last known data to keep the video perfectly smooth!
+        if self.frame_count % 2 != 0:
+            h, w, _ = img.shape
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            res = face_mesh.process(rgb)
+
+            pitch = 0.0 
             
-            leye_pts = [lm[i] for i in LEFT_EYE]
-            reye_pts = [lm[i] for i in RIGHT_EYE]
-            mouth_pts = [lm[i] for i in MOUTH_INNER]
-            mouth_outer_pts = [lm[i] for i in MOUTH_OUTER]
-            pose_pts = [lm[i] for i in POSE_LANDMARKS]
-            
-            avg_ear = (ear(leye_pts) + ear(reye_pts)) / 2.0
-            mar_val = mar(mouth_outer_pts)
-            blink_duration = self.blink_detector.update(avg_ear)
-
-            pts2d = np.array([[int(p.x * w), int(p.y * h)] for p in pose_pts], dtype=np.float64)
-            cam_matrix = np.array([[w, 0, w / 2], [0, w, h / 2], [0, 0, 1]], dtype=np.float64)
-            
-            try:
-                _, rot, _ = cv2.solvePnP(face_model_3d, pts2d, cam_matrix, np.zeros((4, 1)), flags=cv2.SOLVEPNP_ITERATIVE)
-                pitch, _, _ = euler(rot)
-            except Exception:
-                pitch = 0.0
-
-            current_features = [avg_ear, mar_val, pitch, blink_duration]
-            scaled_features = scaler.transform([current_features])[0]
-            self.data_buffer.append(scaled_features)
-
-            if len(self.data_buffer) == SEQ_LEN:
-                X = np.expand_dims(self.data_buffer, axis=0)
+            if res.multi_face_landmarks:
+                lm = res.multi_face_landmarks[0].landmark
                 
-                # MASSIVE LATENCY FIX: 
-                # Using model(X) instead of model.predict(X) skips the heavy TensorFlow batching overhead
-                pred = model(X, training=False)[0].numpy()
-                drowsy_prob = pred[1] 
+                leye_pts = [lm[i] for i in LEFT_EYE]
+                reye_pts = [lm[i] for i in RIGHT_EYE]
+                mouth_pts = [lm[i] for i in MOUTH_INNER]
+                mouth_outer_pts = [lm[i] for i in MOUTH_OUTER]
+                pose_pts = [lm[i] for i in POSE_LANDMARKS]
                 
-                pitch_is_drowsy = (pitch > PITCH_DROWSY_THRESHOLD)
-                
-                if (drowsy_prob > PRED_THRESHOLD) or pitch_is_drowsy:
-                    self.consec_alert_frames += 1
-                else:
-                    self.consec_alert_frames = max(0, self.consec_alert_frames - 1)
+                self.last_avg_ear = (ear(leye_pts) + ear(reye_pts)) / 2.0
+                self.last_mar_val = mar(mouth_outer_pts)
+                self.last_blink = self.blink_detector.update(self.last_avg_ear)
 
-                if self.consec_alert_frames >= ALERT_CONSEC_FRAMES:
-                    self.status = "DROWSY - WAKE UP!"
-                    self.color = (0, 0, 255) 
-                    self.is_drowsy = True 
-                else:
-                    self.status = "ALERT"
-                    self.color = (0, 255, 0) 
-                    self.is_drowsy = False 
-
-                conf_text = f"LSTM Conf: {drowsy_prob:.2f}"
-                cv2.putText(img, conf_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                pts2d = np.array([[int(p.x * w), int(p.y * h)] for p in pose_pts], dtype=np.float64)
+                cam_matrix = np.array([[w, 0, w / 2], [0, w, h / 2], [0, 0, 1]], dtype=np.float64)
                 
+                try:
+                    _, rot, _ = cv2.solvePnP(face_model_3d, pts2d, cam_matrix, np.zeros((4, 1)), flags=cv2.SOLVEPNP_ITERATIVE)
+                    self.last_pitch, _, _ = euler(rot)
+                except Exception:
+                    self.last_pitch = 0.0
+
+                current_features = [self.last_avg_ear, self.last_mar_val, self.last_pitch, self.last_blink]
+                scaled_features = scaler.transform([current_features])[0]
+                self.data_buffer.append(scaled_features)
+
+                if len(self.data_buffer) == SEQ_LEN:
+                    X = np.expand_dims(self.data_buffer, axis=0)
+                    pred = model(X, training=False)[0].numpy()
+                    self.last_drowsy_prob = pred[1] 
+                    
+                    pitch_is_drowsy = (self.last_pitch > PITCH_DROWSY_THRESHOLD)
+                    
+                    if (self.last_drowsy_prob > PRED_THRESHOLD) or pitch_is_drowsy:
+                        self.consec_alert_frames += 1
+                    else:
+                        self.consec_alert_frames = max(0, self.consec_alert_frames - 1)
+
+                    if self.consec_alert_frames >= ALERT_CONSEC_FRAMES:
+                        self.status = "DROWSY - WAKE UP!"
+                        self.color = (0, 0, 255) 
+                        self.is_drowsy = True 
+                    else:
+                        self.status = "ALERT"
+                        self.color = (0, 255, 0) 
+                        self.is_drowsy = False 
             else:
-                self.status = f"WARMING UP LSTM... {len(self.data_buffer)}/{SEQ_LEN}"
-                self.color = (0, 255, 255)
+                self.data_buffer.clear()
+                self.consec_alert_frames = 0
+                self.blink_detector.counter = 0
+                self.status = "NO FACE DETECTED"
+                self.color = (0, 0, 255)
                 self.is_drowsy = False
 
-            # Draw Debug Info
-            debug_color = (255, 255, 0) 
-            cv2.putText(img, f"EAR: {avg_ear:.2f} | MAR: {mar_val:.2f}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, debug_color, 2)
-            cv2.putText(img, f"Pitch: {pitch:.1f} | Blink: {blink_duration:.2f}s", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, debug_color, 2)
-
-        else:
-            self.data_buffer.clear()
-            self.consec_alert_frames = 0
-            self.blink_detector.counter = 0
-            self.blink_detector.blink_start_time = 0
-            self.status = "NO FACE DETECTED"
-            self.color = (0, 0, 255)
-            self.is_drowsy = False
-
+        # DRAWING LAYER (Executes on EVERY frame, making the video look incredibly smooth)
         cv2.putText(img, f"Status: {self.status}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.color, 2)
+        
+        if len(self.data_buffer) == SEQ_LEN and self.status != "NO FACE DETECTED":
+            cv2.putText(img, f"LSTM Conf: {self.last_drowsy_prob:.2f}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        elif self.status != "NO FACE DETECTED":
+            cv2.putText(img, f"WARMING UP... {len(self.data_buffer)}/{SEQ_LEN}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        if self.status != "NO FACE DETECTED":
+            debug_color = (255, 255, 0) 
+            cv2.putText(img, f"EAR: {self.last_avg_ear:.2f} | MAR: {self.last_mar_val:.2f}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, debug_color, 2)
+            cv2.putText(img, f"Pitch: {self.last_pitch:.1f} | Blink: {self.last_blink:.2f}s", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, debug_color, 2)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
@@ -199,20 +205,15 @@ def get_audio_html(file_path):
 # --- Main Streamlit Execution ---
 st.write("Click 'Start' to activate your webcam and begin drowsiness detection.")
 
-# MIC AND LATENCY FIX:
-# "audio": False completely kills the microphone echo.
-# "ideal" resolution politely asks the browser for a smaller video feed without causing a hardware crash.
 ctx = webrtc_streamer(
     key="drowsiness",
     video_processor_factory=DrowsinessProcessor,
     rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
     media_stream_constraints={
-        "video": {
-            "width": {"ideal": 640}, 
-            "height": {"ideal": 480}
-        }, 
+        "video": True, 
         "audio": False
-    }
+    },
+    async_processing=True # Ensures the video thread doesn't wait on Python execution
 )
 
 audio_placeholder = st.empty()
