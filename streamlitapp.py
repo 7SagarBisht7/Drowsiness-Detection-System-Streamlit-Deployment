@@ -23,6 +23,11 @@ ALERT_CONSEC_FRAMES = 5
 PRED_THRESHOLD = 0.55        
 PITCH_DROWSY_THRESHOLD = -160.0 
 
+# NEW: Tuned Thresholds for overrides
+EAR_THRESH = 0.25             # Hard threshold for eyes closed
+MICRO_SLEEP_TIME = 1.0        # Seconds of eyes closed to instantly trigger alarm
+HEAD_DROP_FRAMES = 5          # Frames without face to trigger head-drop alarm
+
 LEFT_EYE = [362, 385, 387, 263, 373, 380]
 RIGHT_EYE = [33, 160, 158, 133, 153, 144]
 MOUTH_INNER = [78, 308, 303, 73, 12, 11]
@@ -59,10 +64,6 @@ def mar(pts):
     try: return dist(pts[2], pts[3]) / dist(pts[0], pts[1])
     except ZeroDivisionError: return 0.0
 
-def mouth_distance(pts):
-    try: return dist(pts[0], pts[1])
-    except ZeroDivisionError: return 0.0
-
 def euler(rot_vec):
     R, _ = cv2.Rodrigues(rot_vec)
     sy = math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
@@ -73,30 +74,31 @@ def euler(rot_vec):
     return math.degrees(x), math.degrees(y), math.degrees(z)
 
 class BlinkDetector:
-    def __init__(self, ear_thresh=0.30, consec_frames=1):
+    def __init__(self, ear_thresh=EAR_THRESH):
         self.ear_thresh = ear_thresh
-        self.consec_frames = consec_frames
         self.counter = 0
         self.blink_start_time = 0
 
     def update(self, ear_val):
-        duration_to_return = 0.0
+        # FIX 1: Live stopwatch. Now it reports time continually WHILE eyes are closed.
         if ear_val < self.ear_thresh:
-            if self.counter == 0: self.blink_start_time = time.time()
+            if self.counter == 0: 
+                self.blink_start_time = time.time()
             self.counter += 1
+            return time.time() - self.blink_start_time
         else:
-            if self.counter >= self.consec_frames:
-                duration_to_return = time.time() - self.blink_start_time
             self.counter = 0
             self.blink_start_time = 0
-        return duration_to_return
+            return 0.0
 
 # --- WebRTC Video Processor ---
 class DrowsinessProcessor(VideoProcessorBase):
     def __init__(self):
         self.data_buffer = deque(maxlen=SEQ_LEN)
         self.consec_alert_frames = 0
-        self.blink_detector = BlinkDetector(ear_thresh=0.30, consec_frames=1)
+        self.missing_face_frames = 0  # NEW: Tracks head drops
+        self.blink_detector = BlinkDetector(ear_thresh=EAR_THRESH)
+        
         self.status = "STARTING..."
         self.color = (0, 255, 255)
         self.is_drowsy = False 
@@ -118,6 +120,7 @@ class DrowsinessProcessor(VideoProcessorBase):
             res = face_mesh.process(rgb)
 
             if res.multi_face_landmarks:
+                self.missing_face_frames = 0 # Reset missing counter
                 lm = res.multi_face_landmarks[0].landmark
                 
                 leye_pts = [lm[i] for i in LEFT_EYE]
@@ -148,13 +151,14 @@ class DrowsinessProcessor(VideoProcessorBase):
                     pred = model(X, training=False)[0].numpy()
                     self.last_drowsy_prob = pred[1] 
                     
+                    # Hard Overrides
                     pitch_is_drowsy = (self.last_pitch > PITCH_DROWSY_THRESHOLD)
+                    eyes_closed_drowsy = (self.last_blink >= MICRO_SLEEP_TIME)
                     
-                    if (self.last_drowsy_prob > PRED_THRESHOLD) or pitch_is_drowsy:
+                    if (self.last_drowsy_prob > PRED_THRESHOLD) or pitch_is_drowsy or eyes_closed_drowsy:
                         self.consec_alert_frames += 1
                     else:
-                        # FAST RECOVERY FIX: Instantly drop the counter to 0 when you open your eyes
-                        self.consec_alert_frames = 0
+                        self.consec_alert_frames = 0 # Instant reset to normal when awake
 
                     if self.consec_alert_frames >= ALERT_CONSEC_FRAMES:
                         self.status = "DROWSY - WAKE UP!"
@@ -165,25 +169,32 @@ class DrowsinessProcessor(VideoProcessorBase):
                         self.color = (0, 255, 0) 
                         self.is_drowsy = False 
             else:
-                self.data_buffer.clear()
-                self.consec_alert_frames = 0
+                # FIX 2: HEAD DROP LOGIC
+                self.missing_face_frames += 1
                 self.blink_detector.counter = 0
-                self.status = "NO FACE DETECTED"
-                self.color = (0, 0, 255)
-                self.is_drowsy = False
+                self.blink_detector.blink_start_time = 0
+                
+                if self.missing_face_frames >= HEAD_DROP_FRAMES:
+                    self.status = "DROWSY - HEAD DROP!"
+                    self.color = (0, 0, 255)
+                    self.is_drowsy = True
+                else:
+                    self.status = "SEARCHING FOR FACE..."
+                    self.color = (0, 165, 255) # Orange warning
+                    self.is_drowsy = False
 
-        # DRAWING LAYER 
-        cv2.putText(img, f"Status: {self.status}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.color, 2)
+        # --- DRAWING LAYER ---
+        cv2.putText(img, f"Status: {self.status}", (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.color, 2)
         
-        if len(self.data_buffer) == SEQ_LEN and self.status != "NO FACE DETECTED":
-            cv2.putText(img, f"LSTM Conf: {self.last_drowsy_prob:.2f}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        elif self.status != "NO FACE DETECTED":
-            cv2.putText(img, f"WARMING UP... {len(self.data_buffer)}/{SEQ_LEN}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        if len(self.data_buffer) == SEQ_LEN and self.missing_face_frames == 0:
+            cv2.putText(img, f"LSTM Conf: {self.last_drowsy_prob:.2f}", (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        elif self.missing_face_frames == 0:
+            cv2.putText(img, f"WARMING UP... {len(self.data_buffer)}/{SEQ_LEN}", (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        if self.status != "NO FACE DETECTED":
+        if self.missing_face_frames == 0:
             debug_color = (255, 255, 0) 
-            cv2.putText(img, f"EAR: {self.last_avg_ear:.2f} | MAR: {self.last_mar_val:.2f}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, debug_color, 2)
-            cv2.putText(img, f"Pitch: {self.last_pitch:.1f} | Blink: {self.last_blink:.2f}s", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, debug_color, 2)
+            cv2.putText(img, f"EAR: {self.last_avg_ear:.2f} | MAR: {self.last_mar_val:.2f}", (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, debug_color, 2)
+            cv2.putText(img, f"Pitch: {self.last_pitch:.1f} | Blink: {self.last_blink:.2f}s", (10, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.6, debug_color, 2)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
@@ -193,7 +204,7 @@ def get_audio_html(file_path):
         with open(file_path, "rb") as f:
             data = f.read()
             b64 = base64.b64encode(data).decode()
-            # AUDIO SYNC FIX: Added loop="true" to the HTML player
+            # loop="true" ensures it keeps beeping until explicitly cleared
             return f'<audio autoplay="true" loop="true" src="data:audio/wav;base64,{b64}"></audio>'
     except FileNotFoundError:
         return "" 
@@ -213,22 +224,20 @@ ctx = webrtc_streamer(
 )
 
 audio_placeholder = st.empty()
-
-# AUDIO SYNC FIX: Track the alarm state so we don't stutter the Streamlit UI
 alarm_playing = False
 
+# Background Audio Loop
 if ctx.state.playing:
     while True:
         if ctx.video_processor:
-            # If Drowsy and alarm isn't playing yet -> Turn it ON
             if ctx.video_processor.is_drowsy and not alarm_playing:
+                # Turn alarm ON
                 audio_placeholder.markdown(get_audio_html("alert.wav"), unsafe_allow_html=True)
                 alarm_playing = True
             
-            # If Awake and alarm is still playing -> Turn it OFF instantly
             elif not ctx.video_processor.is_drowsy and alarm_playing:
+                # Turn alarm OFF instantly
                 audio_placeholder.empty()
                 alarm_playing = False
                 
-        # Fast 0.2s polling keeps the UI perfectly synced with the video
-        time.sleep(0.2)
+        time.sleep(0.2) # Fast poll to keep visual and audio perfectly synced
