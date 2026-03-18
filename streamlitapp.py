@@ -40,7 +40,6 @@ def load_models():
     scaler = joblib.load(SCALER_PATH)
     mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
         max_num_faces=1,
-        # LATENCY FIX 1: Turn off pupil refinement. Saves ~30% CPU per frame.
         refine_landmarks=False, 
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
@@ -102,7 +101,6 @@ class DrowsinessProcessor(VideoProcessorBase):
         self.color = (0, 255, 255)
         self.is_drowsy = False 
         
-        # LATENCY FIX 2: Frame Skipping Variables
         self.frame_count = 0
         self.last_drowsy_prob = 0.0
         self.last_avg_ear = 0.0
@@ -114,15 +112,11 @@ class DrowsinessProcessor(VideoProcessorBase):
         img = frame.to_ndarray(format="bgr24")
         self.frame_count += 1
 
-        # LATENCY FIX 2 (Execution): Only process heavy math on every 2nd frame
-        # On skipped frames, we just draw the last known data to keep the video perfectly smooth!
         if self.frame_count % 2 != 0:
             h, w, _ = img.shape
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             res = face_mesh.process(rgb)
 
-            pitch = 0.0 
-            
             if res.multi_face_landmarks:
                 lm = res.multi_face_landmarks[0].landmark
                 
@@ -159,7 +153,8 @@ class DrowsinessProcessor(VideoProcessorBase):
                     if (self.last_drowsy_prob > PRED_THRESHOLD) or pitch_is_drowsy:
                         self.consec_alert_frames += 1
                     else:
-                        self.consec_alert_frames = max(0, self.consec_alert_frames - 1)
+                        # FAST RECOVERY FIX: Instantly drop the counter to 0 when you open your eyes
+                        self.consec_alert_frames = 0
 
                     if self.consec_alert_frames >= ALERT_CONSEC_FRAMES:
                         self.status = "DROWSY - WAKE UP!"
@@ -177,7 +172,7 @@ class DrowsinessProcessor(VideoProcessorBase):
                 self.color = (0, 0, 255)
                 self.is_drowsy = False
 
-        # DRAWING LAYER (Executes on EVERY frame, making the video look incredibly smooth)
+        # DRAWING LAYER 
         cv2.putText(img, f"Status: {self.status}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.color, 2)
         
         if len(self.data_buffer) == SEQ_LEN and self.status != "NO FACE DETECTED":
@@ -198,7 +193,8 @@ def get_audio_html(file_path):
         with open(file_path, "rb") as f:
             data = f.read()
             b64 = base64.b64encode(data).decode()
-            return f'<audio autoplay="true" src="data:audio/wav;base64,{b64}"></audio>'
+            # AUDIO SYNC FIX: Added loop="true" to the HTML player
+            return f'<audio autoplay="true" loop="true" src="data:audio/wav;base64,{b64}"></audio>'
     except FileNotFoundError:
         return "" 
 
@@ -213,18 +209,26 @@ ctx = webrtc_streamer(
         "video": True, 
         "audio": False
     },
-    async_processing=True # Ensures the video thread doesn't wait on Python execution
+    async_processing=True 
 )
 
 audio_placeholder = st.empty()
 
-# Background loop to check for drowsiness and play sound
+# AUDIO SYNC FIX: Track the alarm state so we don't stutter the Streamlit UI
+alarm_playing = False
+
 if ctx.state.playing:
     while True:
         if ctx.video_processor:
-            if ctx.video_processor.is_drowsy:
+            # If Drowsy and alarm isn't playing yet -> Turn it ON
+            if ctx.video_processor.is_drowsy and not alarm_playing:
                 audio_placeholder.markdown(get_audio_html("alert.wav"), unsafe_allow_html=True)
-                time.sleep(1.5) 
-            else:
+                alarm_playing = True
+            
+            # If Awake and alarm is still playing -> Turn it OFF instantly
+            elif not ctx.video_processor.is_drowsy and alarm_playing:
                 audio_placeholder.empty()
-        time.sleep(0.5)
+                alarm_playing = False
+                
+        # Fast 0.2s polling keeps the UI perfectly synced with the video
+        time.sleep(0.2)
